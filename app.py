@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Deriv WebSocket Proxy for Render.com
-Includes dummy endpoint for keep-alive (cron jobs)
-Fixed for Python 3.11 compatibility
+Fixed connection issues with better logging
 """
 
 import json
@@ -10,15 +9,20 @@ import time
 import threading
 import websocket
 import os
-from flask import Flask, request, jsonify, send_from_directory
+import logging
+from flask import Flask, request, jsonify
 from flask_cors import CORS
+
+# ===== LOGGING =====
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ===== CONFIG =====
 APP_ID = 117548
 API_TOKEN = 'pat_dd21039e2e06160bc8464e9c1b5aecb6b6d0ac4f819652dc1d32bf4aea4955bd'
 WS_URL = f'wss://ws.deriv.com/websockets/v3?app_id={APP_ID}'
 
-# ===== FLASK APP with explicit instance_path to avoid pkgutil issue =====
+# ===== FLASK APP =====
 app = Flask(__name__, instance_path=os.path.join(os.getcwd(), 'instance'), instance_relative_config=False)
 CORS(app)
 
@@ -27,20 +31,22 @@ ws = None
 is_ready = False
 pending_trades = {}
 latest_price = None
-latest_status = "Disconnected"
+latest_status = "Initializing..."
 trade_results = []
 current_symbol = 'stpRNG'
+connection_attempts = 0
 
 # ===== WEBSOCKET =====
 def on_message(ws, message):
     global is_ready, pending_trades, latest_price, latest_status, trade_results
     try:
         data = json.loads(message)
+        logger.info(f"📨 WS: {data}")
 
         if 'authorize' in data:
             is_ready = True
             latest_status = "Connected"
-            print(f"✅ Connected to Deriv (App ID: {APP_ID})")
+            logger.info(f"✅ Connected to Deriv (App ID: {APP_ID})")
 
         if 'tick' in data:
             latest_price = data['tick']['quote']
@@ -61,40 +67,43 @@ def on_message(ws, message):
                     })
                     if len(trade_results) > 20:
                         trade_results.pop(0)
-                    print(f"📈 Contract {contract_id}: {result} | Profit: ${profit:.2f}")
+                    logger.info(f"📈 Contract {contract_id}: {result} | Profit: ${profit:.2f}")
                     del pending_trades[contract_id]
 
         if 'buy' in data:
             contract_id = data['buy']['contract_id']
             pending_trades[contract_id] = True
-            print(f"✅ Trade placed! Contract ID: {contract_id}")
+            logger.info(f"✅ Trade placed! Contract ID: {contract_id}")
 
         if 'error' in data:
-            print(f"❌ Error: {data['error']['message']}")
+            logger.error(f"❌ Error: {data['error']['message']}")
             latest_status = f"Error: {data['error']['message']}"
 
     except Exception as e:
-        print(f"⚠️ Message error: {e}")
+        logger.error(f"⚠️ Message error: {e}")
 
 def on_error(ws, error):
     global latest_status
     latest_status = "Connection error"
-    print(f"⚠️ WebSocket error: {error}")
+    logger.error(f"⚠️ WebSocket error: {error}")
 
 def on_close(ws, close_status_code, close_msg):
     global is_ready, latest_status
     is_ready = False
     latest_status = "Disconnected"
-    print("🔌 Disconnected. Reconnecting in 3s...")
+    logger.info(f"🔌 Disconnected. Code: {close_status_code}, Reason: {close_msg}")
+    logger.info("🔄 Reconnecting in 3s...")
     time.sleep(3)
     connect_websocket()
 
 def on_open(ws):
-    print("🔗 WebSocket opened, authorizing...")
+    logger.info("🔗 WebSocket opened, authorizing...")
     ws.send(json.dumps({"authorize": API_TOKEN, "req_id": 1}))
 
 def connect_websocket():
-    global ws
+    global ws, connection_attempts
+    connection_attempts += 1
+    logger.info(f"🔄 Connection attempt #{connection_attempts}")
     ws = websocket.WebSocketApp(WS_URL,
                                 on_open=on_open,
                                 on_message=on_message,
@@ -106,16 +115,15 @@ def connect_websocket():
 
 # ===== FLASK ROUTES =====
 
-# 1. Keep-alive endpoint (for cron jobs)
 @app.route('/ping')
 def ping():
     return jsonify({
         'status': 'alive',
         'time': time.time(),
-        'connected': is_ready
+        'connected': is_ready,
+        'attempts': connection_attempts
     })
 
-# 2. Health check
 @app.route('/')
 def index():
     return jsonify({
@@ -124,10 +132,10 @@ def index():
         'price': latest_price,
         'connected': is_ready,
         'symbol': current_symbol,
-        'trades': len(trade_results)
+        'trades': len(trade_results),
+        'attempts': connection_attempts
     })
 
-# 3. Status
 @app.route('/status')
 def status():
     return jsonify({
@@ -135,10 +143,10 @@ def status():
         'status': latest_status,
         'price': latest_price,
         'symbol': current_symbol,
-        'trades': trade_results[-10:]
+        'trades': trade_results[-10:],
+        'attempts': connection_attempts
     })
 
-# 4. Trade endpoints
 @app.route('/trade/rise', methods=['POST'])
 def trade_rise():
     return place_trade('CALL')
@@ -147,7 +155,6 @@ def trade_rise():
 def trade_fall():
     return place_trade('PUT')
 
-# 5. Change symbol (optional)
 @app.route('/trade/change_symbol', methods=['POST'])
 def change_symbol():
     global current_symbol
@@ -156,11 +163,11 @@ def change_symbol():
     current_symbol = symbol
     return jsonify({'success': True, 'symbol': current_symbol})
 
-# 6. Trade function
 def place_trade(contract_type):
     global is_ready, ws
 
     if not is_ready or not ws:
+        logger.warning(f"⚠️ Trade attempted but not connected")
         return jsonify({'success': False, 'error': 'Not connected to Deriv'}), 503
 
     data = request.json
@@ -182,13 +189,14 @@ def place_trade(contract_type):
     if allow_equal:
         proposal["allow_equals"] = 1
 
-    print(f"📤 Proposing {contract_type} trade on {symbol}...")
+    logger.info(f"📤 Proposing {contract_type} trade on {symbol}...")
     ws.send(json.dumps(proposal))
     return jsonify({'success': True, 'message': 'Trade proposed'})
 
 # ===== START =====
 if __name__ == '__main__':
-    print("🚀 Deriv Proxy Server starting...")
+    logger.info("🚀 Deriv Proxy Server starting...")
     connect_websocket()
     time.sleep(2)
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
