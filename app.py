@@ -2,12 +2,14 @@
 """
 Deriv WebSocket Proxy for Render.com
 Includes dummy endpoint for keep-alive (cron jobs)
+Fixed for Python 3.11 compatibility
 """
 
 import json
 import time
 import threading
 import websocket
+import os
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
@@ -16,7 +18,8 @@ APP_ID = 117548
 API_TOKEN = 'pat_dd21039e2e06160bc8464e9c1b5aecb6b6d0ac4f819652dc1d32bf4aea4955bd'
 WS_URL = f'wss://ws.deriv.com/websockets/v3?app_id={APP_ID}'
 
-app = Flask(__name__)
+# ===== FLASK APP with explicit instance_path to avoid pkgutil issue =====
+app = Flask(__name__, instance_path=os.path.join(os.getcwd(), 'instance'), instance_relative_config=False)
 CORS(app)
 
 # ===== STATE =====
@@ -106,7 +109,6 @@ def connect_websocket():
 # 1. Keep-alive endpoint (for cron jobs)
 @app.route('/ping')
 def ping():
-    """Dummy endpoint to keep Render service awake"""
     return jsonify({
         'status': 'alive',
         'time': time.time(),
@@ -145,7 +147,7 @@ def trade_rise():
 def trade_fall():
     return place_trade('PUT')
 
-# 5. Change symbol
+# 5. Change symbol (optional)
 @app.route('/trade/change_symbol', methods=['POST'])
 def change_symbol():
     global current_symbol
