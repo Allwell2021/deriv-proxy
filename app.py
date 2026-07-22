@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Deriv REST Proxy – No WebSocket, 100% reliable on Render
+Deriv REST Proxy – with new API token
 """
 
 import json
@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ===== CONFIG =====
-API_TOKEN = 'pat_dd21039e2e06160bc8464e9c1b5aecb6b6d0ac4f819652dc1d32bf4aea4955bd'  # REPLACE WITH FRESH TOKEN
+API_TOKEN = 'pat_4d0ef5186ccd100fff6c8e6221a99f894a91276218adbe13a363c2dbd2228c31'
 BASE_URL = 'https://api.deriv.com/v3/'
 
 app = Flask(__name__)
@@ -27,7 +27,6 @@ CORS(app)
 trade_history = []
 current_symbol = 'stpRNG'
 latest_price = None
-is_ready = True  # Always ready with REST
 last_error = None
 
 # ===== HELPER: API CALL =====
@@ -37,9 +36,17 @@ def api_call(endpoint, params):
         body = {**params, 'authorize': API_TOKEN}
         logger.info(f"📤 API Call: {endpoint} -> {body}")
         response = requests.post(BASE_URL + endpoint, json=body, timeout=10)
-        data = response.json()
-        logger.info(f"📨 API Response: {data}")
         
+        logger.info(f"📨 Response Status: {response.status_code}")
+        logger.info(f"📨 Response Text: {response.text[:200]}")
+        
+        if response.status_code != 200:
+            return {'success': False, 'error': f'HTTP {response.status_code}: {response.text}'}
+        
+        if not response.text or response.text.strip() == '':
+            return {'success': False, 'error': 'Empty response from server'}
+        
+        data = response.json()
         if 'error' in data:
             error_msg = data['error'].get('message', 'Unknown error')
             logger.error(f"❌ API Error: {error_msg}")
@@ -49,13 +56,16 @@ def api_call(endpoint, params):
     except requests.exceptions.Timeout:
         logger.error("❌ API Timeout")
         return {'success': False, 'error': 'Request timeout'}
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ JSON Parse Error: {e}")
+        logger.error(f"Raw response: {response.text[:200]}")
+        return {'success': False, 'error': f'Invalid JSON response: {response.text[:100]}'}
     except Exception as e:
         logger.error(f"❌ API Exception: {e}")
         return {'success': False, 'error': str(e)}
 
 # ===== FETCH CURRENT PRICE =====
 def fetch_price(symbol='stpRNG'):
-    """Fetch current price for an instrument"""
     result = api_call('ticks', {'ticks': symbol, 'subscribe': 0})
     if result['success'] and 'data' in result:
         data = result['data']
@@ -65,9 +75,7 @@ def fetch_price(symbol='stpRNG'):
 
 # ===== PLACE TRADE =====
 def place_trade(contract_type, symbol, stake, duration, allow_equal):
-    """Place a trade using REST API (proposal + buy)"""
-    
-    # Step 1: Get proposal
+    # Proposal
     proposal_params = {
         'proposal': 1,
         'amount': stake,
@@ -92,7 +100,7 @@ def place_trade(contract_type, symbol, stake, duration, allow_equal):
     proposal_id = proposal_data['proposal']['id']
     price = proposal_data['proposal']['ask_price']
     
-    # Step 2: Buy
+    # Buy
     buy_result = api_call('buy', {'buy': proposal_id, 'price': price})
     if not buy_result['success']:
         return buy_result
@@ -103,7 +111,7 @@ def place_trade(contract_type, symbol, stake, duration, allow_equal):
     
     contract_id = buy_data['buy']['contract_id']
     
-    # Step 3: Track the trade (poll for result)
+    # Track the trade
     trade_info = {
         'contract_id': contract_id,
         'symbol': symbol,
@@ -117,12 +125,10 @@ def place_trade(contract_type, symbol, stake, duration, allow_equal):
     }
     trade_history.append(trade_info)
     
-    # Start background polling for this trade
     def poll_trade():
         nonlocal trade_info
         start = time.time()
-        timeout = duration + 10  # duration in seconds + buffer
-        
+        timeout = duration + 10
         while time.time() - start < timeout:
             time.sleep(2)
             status_result = api_call('contract_update', {'contract_id': contract_id})
@@ -137,22 +143,17 @@ def place_trade(contract_type, symbol, stake, duration, allow_equal):
                         trade_info['profit'] = profit
                         logger.info(f"📈 Contract {contract_id}: {trade_info['result']} | Profit: ${profit:.2f}")
                         return
-        
-        # Timeout – trade didn't finish
         if trade_info['status'] == 'active':
             trade_info['status'] = 'expired'
             logger.info(f"⏰ Contract {contract_id} expired")
     
     threading.Thread(target=poll_trade, daemon=True).start()
-    
     return {'success': True, 'contract_id': contract_id, 'message': 'Trade placed'}
 
 # ===== FLASK ROUTES =====
-
 @app.route('/ping')
 def ping():
     global latest_price
-    # Fetch price on ping to keep data fresh
     price = fetch_price(current_symbol)
     if price:
         latest_price = price
@@ -162,7 +163,8 @@ def ping():
         'connected': True,
         'price': latest_price,
         'symbol': current_symbol,
-        'trades': len(trade_history)
+        'trades': len(trade_history),
+        'last_error': last_error
     })
 
 @app.route('/')
@@ -172,12 +174,12 @@ def index():
         'status': 'Connected (REST)',
         'price': latest_price,
         'symbol': current_symbol,
-        'trades': len(trade_history)
+        'trades': len(trade_history),
+        'last_error': last_error
     })
 
 @app.route('/status')
 def status():
-    # Check for completed trades
     completed = [t for t in trade_history if t['status'] in ['sold', 'expired']]
     active = [t for t in trade_history if t['status'] == 'active']
     return jsonify({
@@ -187,7 +189,8 @@ def status():
         'symbol': current_symbol,
         'trades': completed[-10:],
         'active_trades': len(active),
-        'total_trades': len(trade_history)
+        'total_trades': len(trade_history),
+        'last_error': last_error
     })
 
 @app.route('/trade/rise', methods=['POST'])
@@ -204,7 +207,6 @@ def change_symbol():
     data = request.json
     symbol = data.get('symbol', 'stpRNG')
     current_symbol = symbol
-    # Fetch price for new symbol
     price = fetch_price(symbol)
     if price:
         global latest_price
@@ -220,11 +222,9 @@ def handle_trade(contract_type):
     allow_equal = data.get('allow_equal', False)
     
     logger.info(f"📤 Trade request: {contract_type} on {symbol} | Stake: ${stake} | Duration: {duration}s | Equal: {allow_equal}")
-    
     result = place_trade(contract_type, symbol, stake, duration, allow_equal)
     
     if result['success']:
-        # Update price after trade
         price = fetch_price(symbol)
         if price:
             latest_price = price
@@ -247,11 +247,8 @@ def update_price_loop():
 # ===== START =====
 if __name__ == '__main__':
     logger.info("🚀 Deriv REST Proxy starting...")
-    
-    # Start price update thread
     price_thread = threading.Thread(target=update_price_loop)
     price_thread.daemon = True
     price_thread.start()
-    
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
