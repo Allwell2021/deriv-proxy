@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Deriv REST Proxy – with new API token
+Deriv REST Proxy – Fixed API endpoint format
 """
 
 import json
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 # ===== CONFIG =====
 API_TOKEN = 'pat_4d0ef5186ccd100fff6c8e6221a99f894a91276218adbe13a363c2dbd2228c31'
-BASE_URL = 'https://api.deriv.com/v3/'
+BASE_URL = 'https://api.deriv.com/v3'  # Correct: NO trailing slash, NO method in URL
 
 app = Flask(__name__)
 CORS(app)
@@ -29,19 +29,29 @@ current_symbol = 'stpRNG'
 latest_price = None
 last_error = None
 
-# ===== HELPER: API CALL =====
-def api_call(endpoint, params):
-    """Make a POST request to Deriv's REST API"""
+# ===== CORRECT API CALL =====
+def api_call(method, params):
+    """
+    Make a POST request to Deriv's REST API.
+    method: string like 'ticks', 'proposal', 'buy', etc.
+    params: dict of parameters for that method
+    """
     try:
-        body = {**params, 'authorize': API_TOKEN}
-        logger.info(f"📤 API Call: {endpoint} -> {body}")
-        response = requests.post(BASE_URL + endpoint, json=body, timeout=10)
+        # Build the body: method name as key + params + authorize
+        body = {method: params.get(method, params)}
+        # If params already has the method key, use it; otherwise add method
+        if method not in body:
+            body[method] = params
+        body['authorize'] = API_TOKEN
+        
+        logger.info(f"📤 API Call: {method} -> {body}")
+        response = requests.post(BASE_URL, json=body, timeout=10)
         
         logger.info(f"📨 Response Status: {response.status_code}")
         logger.info(f"📨 Response Text: {response.text[:200]}")
         
         if response.status_code != 200:
-            return {'success': False, 'error': f'HTTP {response.status_code}: {response.text}'}
+            return {'success': False, 'error': f'HTTP {response.status_code}: {response.text[:100]}'}
         
         if not response.text or response.text.strip() == '':
             return {'success': False, 'error': 'Empty response from server'}
@@ -246,7 +256,7 @@ def update_price_loop():
 
 # ===== START =====
 if __name__ == '__main__':
-    logger.info("🚀 Deriv REST Proxy starting...")
+    logger.info("🚀 Deriv REST Proxy starting (correct API format)...")
     price_thread = threading.Thread(target=update_price_loop)
     price_thread.daemon = True
     price_thread.start()
