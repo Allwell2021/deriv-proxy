@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Deriv REST Proxy – Fixed API endpoint format
+Deriv REST Proxy – Correct API endpoint
 """
 
 import json
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 # ===== CONFIG =====
 API_TOKEN = 'pat_4d0ef5186ccd100fff6c8e6221a99f894a91276218adbe13a363c2dbd2228c31'
-BASE_URL = 'https://api.deriv.com/v3'  # Correct: NO trailing slash, NO method in URL
+BASE_URL = 'https://api.deriv.com/v3'  # Correct base URL
 
 app = Flask(__name__)
 CORS(app)
@@ -28,21 +28,32 @@ trade_history = []
 current_symbol = 'stpRNG'
 latest_price = None
 last_error = None
+pending_trades = {}
 
 # ===== CORRECT API CALL =====
 def api_call(method, params):
-    """
-    Make a POST request to Deriv's REST API.
-    method: string like 'ticks', 'proposal', 'buy', etc.
-    params: dict of parameters for that method
-    """
+    """Make a POST request to Deriv's REST API"""
     try:
-        # Build the body: method name as key + params + authorize
-        body = {method: params.get(method, params)}
-        # If params already has the method key, use it; otherwise add method
+        # Build the request body
+        body = {**params, 'authorize': API_TOKEN}
+        # Add the method name as a key if not already present
         if method not in body:
-            body[method] = params
-        body['authorize'] = API_TOKEN
+            # For 'ticks' method, the param is 'ticks'
+            if method == 'ticks':
+                body = {'ticks': params.get('ticks'), 'subscribe': params.get('subscribe', 0), 'authorize': API_TOKEN}
+            elif method == 'proposal':
+                body = {'proposal': params.get('proposal'), 'amount': params.get('amount'), 'basis': params.get('basis'),
+                        'contract_type': params.get('contract_type'), 'currency': params.get('currency'),
+                        'duration': params.get('duration'), 'duration_unit': params.get('duration_unit'),
+                        'symbol': params.get('symbol'), 'authorize': API_TOKEN}
+                if 'allow_equals' in params:
+                    body['allow_equals'] = params['allow_equals']
+            elif method == 'buy':
+                body = {'buy': params.get('buy'), 'price': params.get('price'), 'authorize': API_TOKEN}
+            elif method == 'contract_update':
+                body = {'contract_update': params.get('contract_id'), 'authorize': API_TOKEN}
+            else:
+                body = {method: params, 'authorize': API_TOKEN}
         
         logger.info(f"📤 API Call: {method} -> {body}")
         response = requests.post(BASE_URL, json=body, timeout=10)
@@ -69,7 +80,7 @@ def api_call(method, params):
     except json.JSONDecodeError as e:
         logger.error(f"❌ JSON Parse Error: {e}")
         logger.error(f"Raw response: {response.text[:200]}")
-        return {'success': False, 'error': f'Invalid JSON response: {response.text[:100]}'}
+        return {'success': False, 'error': f'Invalid JSON response'}
     except Exception as e:
         logger.error(f"❌ API Exception: {e}")
         return {'success': False, 'error': str(e)}
@@ -85,7 +96,7 @@ def fetch_price(symbol='stpRNG'):
 
 # ===== PLACE TRADE =====
 def place_trade(contract_type, symbol, stake, duration, allow_equal):
-    # Proposal
+    # Step 1: Proposal
     proposal_params = {
         'proposal': 1,
         'amount': stake,
@@ -110,7 +121,7 @@ def place_trade(contract_type, symbol, stake, duration, allow_equal):
     proposal_id = proposal_data['proposal']['id']
     price = proposal_data['proposal']['ask_price']
     
-    # Buy
+    # Step 2: Buy
     buy_result = api_call('buy', {'buy': proposal_id, 'price': price})
     if not buy_result['success']:
         return buy_result
@@ -134,6 +145,7 @@ def place_trade(contract_type, symbol, stake, duration, allow_equal):
         'profit': 0
     }
     trade_history.append(trade_info)
+    pending_trades[contract_id] = trade_info
     
     def poll_trade():
         nonlocal trade_info
@@ -174,6 +186,7 @@ def ping():
         'price': latest_price,
         'symbol': current_symbol,
         'trades': len(trade_history),
+        'pending': len(pending_trades),
         'last_error': last_error
     })
 
@@ -185,6 +198,7 @@ def index():
         'price': latest_price,
         'symbol': current_symbol,
         'trades': len(trade_history),
+        'pending': len(pending_trades),
         'last_error': last_error
     })
 
@@ -256,7 +270,7 @@ def update_price_loop():
 
 # ===== START =====
 if __name__ == '__main__':
-    logger.info("🚀 Deriv REST Proxy starting (correct API format)...")
+    logger.info("🚀 Deriv REST Proxy starting (correct endpoint)...")
     price_thread = threading.Thread(target=update_price_loop)
     price_thread.daemon = True
     price_thread.start()
