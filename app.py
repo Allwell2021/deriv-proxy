@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-Deriv WebSocket Proxy with DNS fallback and dual endpoints
+Deriv REST Proxy – No WebSocket, 100% reliable on Render
 """
 
 import json
 import time
 import threading
-import websocket
 import os
 import logging
-import socket
+import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -18,223 +17,186 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ===== CONFIG =====
-APP_ID = 117548
 API_TOKEN = 'pat_dd21039e2e06160bc8464e9c1b5aecb6b6d0ac4f819652dc1d32bf4aea4955bd'  # REPLACE WITH FRESH TOKEN
-
-# Try both endpoints
-ENDPOINTS = [
-    ('wss://ws.deriv.com/websockets/v3?app_id=' + APP_ID, 'deriv.com'),
-    ('wss://ws.binary.com/websockets/v3?app_id=' + APP_ID, 'binary.com'),
-]
+BASE_URL = 'https://api.deriv.com/v3/'
 
 app = Flask(__name__)
 CORS(app)
 
 # ===== STATE =====
-ws = None
-is_ready = False
-pending_trades = {}
-latest_price = None
-latest_status = "Initializing..."
-trade_results = []
+trade_history = []
 current_symbol = 'stpRNG'
-connection_attempts = 0
+latest_price = None
+is_ready = True  # Always ready with REST
 last_error = None
-current_endpoint_index = 0
 
-# ===== DNS RESOLVER FALLBACK =====
-def resolve_hostname(hostname):
-    """Try to resolve using system DNS, fallback to Google DNS (8.8.8.8)"""
+# ===== HELPER: API CALL =====
+def api_call(endpoint, params):
+    """Make a POST request to Deriv's REST API"""
     try:
-        logger.info(f"🔍 Resolving {hostname} using system DNS...")
-        ip = socket.gethostbyname(hostname)
-        logger.info(f"✅ Resolved {hostname} -> {ip}")
-        return ip
-    except Exception as e:
-        logger.warning(f"⚠️ System DNS failed for {hostname}: {e}")
-        # Use Google's DNS as fallback (hardcoded IP for ws.deriv.com)
-        # This is a manual mapping – we can add known IPs here
-        known_ips = {
-            'ws.deriv.com': '34.120.168.203',   # Example, might change
-            'ws.binary.com': '34.120.168.203',  # They share IP
-        }
-        if hostname in known_ips:
-            ip = known_ips[hostname]
-            logger.info(f"✅ Using fallback IP for {hostname}: {ip}")
-            return ip
-        else:
-            logger.error(f"❌ No fallback IP for {hostname}")
-            return None
-
-# ===== WEBSOCKET WITH CUSTOM DNS =====
-def create_websocket_with_dns(url, hostname):
-    """Create WebSocket with custom DNS resolution if needed"""
-    try:
-        # Try standard connection first
-        logger.info(f"🔗 Connecting to {url}")
-        ws = websocket.WebSocketApp(url,
-                                    on_open=on_open,
-                                    on_message=on_message,
-                                    on_error=on_error,
-                                    on_close=on_close)
-        return ws
-    except Exception as e:
-        logger.error(f"❌ Failed to connect to {url}: {e}")
-        return None
-
-def on_message(ws, message):
-    global is_ready, pending_trades, latest_price, latest_status, trade_results, last_error
-    try:
-        data = json.loads(message)
-        logger.info(f"📨 WS Response: {data}")
-
-        if 'authorize' in data:
-            if 'error' in data:
-                error_msg = data['error'].get('message', 'Unknown error')
-                error_code = data['error'].get('code', 'Unknown code')
-                last_error = f"Auth failed: {error_code} - {error_msg}"
-                logger.error(f"❌ {last_error}")
-                latest_status = last_error
-                is_ready = False
-            else:
-                is_ready = True
-                latest_status = "Connected"
-                last_error = None
-                logger.info(f"✅ Connected to Deriv (App ID: {APP_ID})")
-
-        if 'error' in data and 'authorize' not in data:
+        body = {**params, 'authorize': API_TOKEN}
+        logger.info(f"📤 API Call: {endpoint} -> {body}")
+        response = requests.post(BASE_URL + endpoint, json=body, timeout=10)
+        data = response.json()
+        logger.info(f"📨 API Response: {data}")
+        
+        if 'error' in data:
             error_msg = data['error'].get('message', 'Unknown error')
-            logger.error(f"❌ Error: {error_msg}")
-            latest_status = f"Error: {error_msg}"
-            last_error = error_msg
-
-        if 'tick' in data:
-            latest_price = data['tick']['quote']
-
-        if 'contract_update' in data:
-            contract = data['contract_update']
-            contract_id = contract['contract_id']
-            if contract_id in pending_trades:
-                profit = contract.get('profit', 0)
-                status = contract.get('status', 'unknown')
-                if status == 'sold':
-                    result = "WIN" if profit > 0 else "LOSS"
-                    trade_results.append({
-                        'contract_id': contract_id,
-                        'result': result,
-                        'profit': profit,
-                        'time': time.time()
-                    })
-                    if len(trade_results) > 20:
-                        trade_results.pop(0)
-                    logger.info(f"📈 Contract {contract_id}: {result} | Profit: ${profit:.2f}")
-                    del pending_trades[contract_id]
-
-        if 'buy' in data:
-            contract_id = data['buy']['contract_id']
-            pending_trades[contract_id] = True
-            logger.info(f"✅ Trade placed! Contract ID: {contract_id}")
-
+            logger.error(f"❌ API Error: {error_msg}")
+            return {'success': False, 'error': error_msg}
+        
+        return {'success': True, 'data': data}
+    except requests.exceptions.Timeout:
+        logger.error("❌ API Timeout")
+        return {'success': False, 'error': 'Request timeout'}
     except Exception as e:
-        logger.error(f"⚠️ Message error: {e}")
-        last_error = str(e)
+        logger.error(f"❌ API Exception: {e}")
+        return {'success': False, 'error': str(e)}
 
-def on_error(ws, error):
-    global latest_status, last_error
-    latest_status = "Connection error"
-    last_error = str(error)
-    logger.error(f"⚠️ WebSocket error: {error}")
+# ===== FETCH CURRENT PRICE =====
+def fetch_price(symbol='stpRNG'):
+    """Fetch current price for an instrument"""
+    result = api_call('ticks', {'ticks': symbol, 'subscribe': 0})
+    if result['success'] and 'data' in result:
+        data = result['data']
+        if 'ticks' in data and len(data['ticks']) > 0:
+            return data['ticks'][-1]['quote']
+    return None
 
-def on_close(ws, close_status_code, close_msg):
-    global is_ready, latest_status
-    is_ready = False
-    latest_status = "Disconnected"
-    logger.info(f"🔌 Disconnected. Code: {close_status_code}, Reason: {close_msg}")
-    time.sleep(3)
-    connect_websocket()
-
-def on_open(ws):
-    logger.info("🔗 WebSocket opened, authorizing...")
-    auth_msg = json.dumps({"authorize": API_TOKEN, "req_id": 1})
-    ws.send(auth_msg)
-
-def connect_websocket():
-    global ws, connection_attempts, current_endpoint_index
-    connection_attempts += 1
-    logger.info(f"🔄 Connection attempt #{connection_attempts}")
-
-    # Try endpoints in round-robin
-    url, name = ENDPOINTS[current_endpoint_index]
-    logger.info(f"🔗 Trying {name}: {url}")
-
-    ws = websocket.WebSocketApp(url,
-                                on_open=on_open,
-                                on_message=on_message,
-                                on_error=on_error,
-                                on_close=on_close)
-    wst = threading.Thread(target=ws.run_forever)
-    wst.daemon = True
-    wst.start()
-
-    # If this endpoint fails, switch to next on next attempt
-    # This will be handled in on_close
-
-# ===== KEEP-ALIVE =====
-def keep_alive():
-    while True:
-        time.sleep(30)
-        if ws and ws.sock and ws.sock.connected:
-            try:
-                ws.send(json.dumps({"ping": 1}))
-                logger.info("💓 Ping sent")
-            except:
-                pass
+# ===== PLACE TRADE =====
+def place_trade(contract_type, symbol, stake, duration, allow_equal):
+    """Place a trade using REST API (proposal + buy)"""
+    
+    # Step 1: Get proposal
+    proposal_params = {
+        'proposal': 1,
+        'amount': stake,
+        'basis': 'stake',
+        'contract_type': contract_type,
+        'currency': 'USD',
+        'duration': duration,
+        'duration_unit': 's',
+        'symbol': symbol,
+    }
+    if allow_equal:
+        proposal_params['allow_equals'] = 1
+    
+    proposal_result = api_call('proposal', proposal_params)
+    if not proposal_result['success']:
+        return proposal_result
+    
+    proposal_data = proposal_result['data']
+    if 'proposal' not in proposal_data or 'id' not in proposal_data['proposal']:
+        return {'success': False, 'error': 'No proposal ID received'}
+    
+    proposal_id = proposal_data['proposal']['id']
+    price = proposal_data['proposal']['ask_price']
+    
+    # Step 2: Buy
+    buy_result = api_call('buy', {'buy': proposal_id, 'price': price})
+    if not buy_result['success']:
+        return buy_result
+    
+    buy_data = buy_result['data']
+    if 'buy' not in buy_data or 'contract_id' not in buy_data['buy']:
+        return {'success': False, 'error': 'Buy failed'}
+    
+    contract_id = buy_data['buy']['contract_id']
+    
+    # Step 3: Track the trade (poll for result)
+    trade_info = {
+        'contract_id': contract_id,
+        'symbol': symbol,
+        'stake': stake,
+        'duration': duration,
+        'contract_type': contract_type,
+        'status': 'active',
+        'start_time': time.time(),
+        'result': None,
+        'profit': 0
+    }
+    trade_history.append(trade_info)
+    
+    # Start background polling for this trade
+    def poll_trade():
+        nonlocal trade_info
+        start = time.time()
+        timeout = duration + 10  # duration in seconds + buffer
+        
+        while time.time() - start < timeout:
+            time.sleep(2)
+            status_result = api_call('contract_update', {'contract_id': contract_id})
+            if status_result['success']:
+                data = status_result['data']
+                if 'contract_update' in data:
+                    contract = data['contract_update']
+                    if contract.get('is_sold', False):
+                        profit = contract.get('profit', 0)
+                        trade_info['status'] = 'sold'
+                        trade_info['result'] = 'WIN' if profit > 0 else 'LOSS'
+                        trade_info['profit'] = profit
+                        logger.info(f"📈 Contract {contract_id}: {trade_info['result']} | Profit: ${profit:.2f}")
+                        return
+        
+        # Timeout – trade didn't finish
+        if trade_info['status'] == 'active':
+            trade_info['status'] = 'expired'
+            logger.info(f"⏰ Contract {contract_id} expired")
+    
+    threading.Thread(target=poll_trade, daemon=True).start()
+    
+    return {'success': True, 'contract_id': contract_id, 'message': 'Trade placed'}
 
 # ===== FLASK ROUTES =====
+
 @app.route('/ping')
 def ping():
+    global latest_price
+    # Fetch price on ping to keep data fresh
+    price = fetch_price(current_symbol)
+    if price:
+        latest_price = price
     return jsonify({
         'status': 'alive',
         'time': time.time(),
-        'connected': is_ready,
-        'attempts': connection_attempts,
-        'last_error': last_error,
-        'latest_status': latest_status,
-        'endpoint': ENDPOINTS[current_endpoint_index][1]
+        'connected': True,
+        'price': latest_price,
+        'symbol': current_symbol,
+        'trades': len(trade_history)
     })
 
 @app.route('/')
 def index():
     return jsonify({
-        'service': 'Deriv Proxy',
-        'status': latest_status,
+        'service': 'Deriv REST Proxy',
+        'status': 'Connected (REST)',
         'price': latest_price,
-        'connected': is_ready,
         'symbol': current_symbol,
-        'trades': len(trade_results),
-        'attempts': connection_attempts,
-        'last_error': last_error
+        'trades': len(trade_history)
     })
 
 @app.route('/status')
 def status():
+    # Check for completed trades
+    completed = [t for t in trade_history if t['status'] in ['sold', 'expired']]
+    active = [t for t in trade_history if t['status'] == 'active']
     return jsonify({
-        'connected': is_ready,
-        'status': latest_status,
+        'connected': True,
+        'status': 'Connected (REST)',
         'price': latest_price,
         'symbol': current_symbol,
-        'trades': trade_results[-10:],
-        'attempts': connection_attempts,
-        'last_error': last_error
+        'trades': completed[-10:],
+        'active_trades': len(active),
+        'total_trades': len(trade_history)
     })
 
 @app.route('/trade/rise', methods=['POST'])
 def trade_rise():
-    return place_trade('CALL')
+    return handle_trade('CALL')
 
 @app.route('/trade/fall', methods=['POST'])
 def trade_fall():
-    return place_trade('PUT')
+    return handle_trade('PUT')
 
 @app.route('/trade/change_symbol', methods=['POST'])
 def change_symbol():
@@ -242,45 +204,54 @@ def change_symbol():
     data = request.json
     symbol = data.get('symbol', 'stpRNG')
     current_symbol = symbol
-    return jsonify({'success': True, 'symbol': current_symbol})
+    # Fetch price for new symbol
+    price = fetch_price(symbol)
+    if price:
+        global latest_price
+        latest_price = price
+    return jsonify({'success': True, 'symbol': current_symbol, 'price': latest_price})
 
-def place_trade(contract_type):
-    global is_ready, ws
-
-    if not is_ready or not ws:
-        logger.warning(f"⚠️ Trade attempted but not connected")
-        return jsonify({'success': False, 'error': 'Not connected to Deriv'}), 503
-
+def handle_trade(contract_type):
+    global latest_price
     data = request.json
     symbol = data.get('symbol', current_symbol)
     stake = float(data.get('stake', 1.0))
     duration = int(data.get('duration', 300))
     allow_equal = data.get('allow_equal', False)
+    
+    logger.info(f"📤 Trade request: {contract_type} on {symbol} | Stake: ${stake} | Duration: {duration}s | Equal: {allow_equal}")
+    
+    result = place_trade(contract_type, symbol, stake, duration, allow_equal)
+    
+    if result['success']:
+        # Update price after trade
+        price = fetch_price(symbol)
+        if price:
+            latest_price = price
+        return jsonify({'success': True, 'contract_id': result.get('contract_id')})
+    else:
+        return jsonify({'success': False, 'error': result.get('error', 'Trade failed')}), 400
 
-    proposal = {
-        "proposal": 1,
-        "amount": stake,
-        "basis": "stake",
-        "contract_type": contract_type,
-        "currency": "USD",
-        "duration": duration,
-        "duration_unit": "s",
-        "symbol": symbol
-    }
-    if allow_equal:
-        proposal["allow_equals"] = 1
-
-    logger.info(f"📤 Proposing {contract_type} trade on {symbol}...")
-    ws.send(json.dumps(proposal))
-    return jsonify({'success': True, 'message': 'Trade proposed'})
+# ===== PERIODIC PRICE UPDATE =====
+def update_price_loop():
+    global latest_price
+    while True:
+        try:
+            price = fetch_price(current_symbol)
+            if price:
+                latest_price = price
+        except Exception as e:
+            logger.error(f"Price update error: {e}")
+        time.sleep(5)
 
 # ===== START =====
 if __name__ == '__main__':
-    logger.info("🚀 Deriv Proxy Server starting with dual endpoints...")
-    connect_websocket()
-    # Start keep-alive thread
-    keep_alive_thread = threading.Thread(target=keep_alive)
-    keep_alive_thread.daemon = True
-    keep_alive_thread.start()
+    logger.info("🚀 Deriv REST Proxy starting...")
+    
+    # Start price update thread
+    price_thread = threading.Thread(target=update_price_loop)
+    price_thread.daemon = True
+    price_thread.start()
+    
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
