@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Deriv REST Proxy – Correct API endpoint
+Deriv REST Proxy – Correct format with proper headers
 """
 
 import json
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 # ===== CONFIG =====
 API_TOKEN = 'pat_4d0ef5186ccd100fff6c8e6221a99f894a91276218adbe13a363c2dbd2228c31'
-BASE_URL = 'https://api.deriv.com/v3'  # Correct base URL
+BASE_URL = 'https://api.deriv.com/v3'
 
 app = Flask(__name__)
 CORS(app)
@@ -32,55 +32,60 @@ pending_trades = {}
 
 # ===== CORRECT API CALL =====
 def api_call(method, params):
-    """Make a POST request to Deriv's REST API"""
+    """Make a POST request to Deriv's REST API with proper headers"""
     try:
-        # Build the request body
+        # Build the request body: method name + params + authorize
         body = {**params, 'authorize': API_TOKEN}
-        # Add the method name as a key if not already present
-        if method not in body:
-            # For 'ticks' method, the param is 'ticks'
-            if method == 'ticks':
-                body = {'ticks': params.get('ticks'), 'subscribe': params.get('subscribe', 0), 'authorize': API_TOKEN}
-            elif method == 'proposal':
-                body = {'proposal': params.get('proposal'), 'amount': params.get('amount'), 'basis': params.get('basis'),
-                        'contract_type': params.get('contract_type'), 'currency': params.get('currency'),
-                        'duration': params.get('duration'), 'duration_unit': params.get('duration_unit'),
-                        'symbol': params.get('symbol'), 'authorize': API_TOKEN}
-                if 'allow_equals' in params:
-                    body['allow_equals'] = params['allow_equals']
-            elif method == 'buy':
-                body = {'buy': params.get('buy'), 'price': params.get('price'), 'authorize': API_TOKEN}
-            elif method == 'contract_update':
-                body = {'contract_update': params.get('contract_id'), 'authorize': API_TOKEN}
-            else:
-                body = {method: params, 'authorize': API_TOKEN}
         
-        logger.info(f"📤 API Call: {method} -> {body}")
-        response = requests.post(BASE_URL, json=body, timeout=10)
+        logger.info(f"📤 API Call: {method}")
+        logger.info(f"📤 Body: {json.dumps(body)[:200]}")
+        
+        # CORRECT: Use the `json` parameter + headers
+        response = requests.post(
+            BASE_URL,
+            json=body,  # This sets Content-Type: application/json automatically
+            headers={
+                'Accept': 'application/json',
+                'User-Agent': 'DerivBot/1.0'
+            },
+            timeout=10
+        )
         
         logger.info(f"📨 Response Status: {response.status_code}")
-        logger.info(f"📨 Response Text: {response.text[:200]}")
+        logger.info(f"📨 Response Headers: {response.headers}")
+        logger.info(f"📨 Response Text (first 500): {response.text[:500]}")
         
         if response.status_code != 200:
-            return {'success': False, 'error': f'HTTP {response.status_code}: {response.text[:100]}'}
+            return {
+                'success': False,
+                'error': f'HTTP {response.status_code}: {response.text[:100]}'
+            }
         
         if not response.text or response.text.strip() == '':
             return {'success': False, 'error': 'Empty response from server'}
         
-        data = response.json()
+        # Try to parse as JSON
+        try:
+            data = response.json()
+        except json.JSONDecodeError:
+            # If it's HTML, the endpoint is wrong
+            logger.error(f"❌ Expected JSON but got: {response.text[:200]}")
+            return {
+                'success': False,
+                'error': 'Invalid JSON response (got HTML) – check API endpoint'
+            }
+        
+        # Check for API error
         if 'error' in data:
             error_msg = data['error'].get('message', 'Unknown error')
             logger.error(f"❌ API Error: {error_msg}")
             return {'success': False, 'error': error_msg}
         
         return {'success': True, 'data': data}
+        
     except requests.exceptions.Timeout:
         logger.error("❌ API Timeout")
         return {'success': False, 'error': 'Request timeout'}
-    except json.JSONDecodeError as e:
-        logger.error(f"❌ JSON Parse Error: {e}")
-        logger.error(f"Raw response: {response.text[:200]}")
-        return {'success': False, 'error': f'Invalid JSON response'}
     except Exception as e:
         logger.error(f"❌ API Exception: {e}")
         return {'success': False, 'error': str(e)}
@@ -96,7 +101,7 @@ def fetch_price(symbol='stpRNG'):
 
 # ===== PLACE TRADE =====
 def place_trade(contract_type, symbol, stake, duration, allow_equal):
-    # Step 1: Proposal
+    # Proposal
     proposal_params = {
         'proposal': 1,
         'amount': stake,
@@ -121,7 +126,7 @@ def place_trade(contract_type, symbol, stake, duration, allow_equal):
     proposal_id = proposal_data['proposal']['id']
     price = proposal_data['proposal']['ask_price']
     
-    # Step 2: Buy
+    # Buy
     buy_result = api_call('buy', {'buy': proposal_id, 'price': price})
     if not buy_result['success']:
         return buy_result
@@ -270,7 +275,7 @@ def update_price_loop():
 
 # ===== START =====
 if __name__ == '__main__':
-    logger.info("🚀 Deriv REST Proxy starting (correct endpoint)...")
+    logger.info("🚀 Deriv REST Proxy starting...")
     price_thread = threading.Thread(target=update_price_loop)
     price_thread.daemon = True
     price_thread.start()
